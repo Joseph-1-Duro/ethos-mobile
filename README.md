@@ -269,6 +269,13 @@ Pushing a `vX.Y.Z` tag (matching `MARKETING_VERSION` in `ios/EthosProtocol/proje
 - "What's New" generator: `.github/scripts/generate_release_notes.py`
 - Setup, secrets, and the maintainer checklist: [docs/ios-app-store-release.md](docs/ios-app-store-release.md)
 
+### Android Google Play release automation
+The same `vX.Y.Z` tag (matching `versionName` in `android/app/build.gradle.kts`) builds the signed release bundle (AAB) and uploads it to Google Play's internal testing track via fastlane. Promotion to production is a staged rollout (10% by default). It's opt-in and gated behind approval on the `play-production` environment, and manual runs can increase, complete, or halt the rollout. Manual runs default to a dry run.
+
+- Workflow: `.github/workflows/android-play-store-release.yml`
+- Lanes: `android/fastlane/Fastfile` (`validate`, `internal`, `production`, `rollout`)
+- Setup, secrets, the first-release manual step, and the maintainer checklist: [docs/android-play-store-release.md](docs/android-play-store-release.md)
+
 ### App Links Verification (Deep Linking & Passkeys)
 
 Both platforms verify that their respective deep-linking and passkey configuration files are correctly hosted and match the app's entitlements/manifest expectations. These checks run daily and on any change to app configuration, catching server-side drift without requiring a code push:

@@ -10,6 +10,24 @@
 
 <!-- How was this tested? (unit tests, manual smoke test, simulator, device, …) -->
 
+## Performance checklist
+
+> Full guide, budgets, and profiling instructions:
+> [docs/performance-guide.md](../docs/performance-guide.md). Answer these if your change
+> could plausibly affect performance.
+
+- [ ] No network, disk, or database I/O added on the main thread or in an initializer.
+- [ ] Any new screen or network path is instrumented (`.trackScreen` / `TrackScreen`).
+- [ ] No unbounded loop, collection growth, or retry without a cap.
+- [ ] If a list or screen changed: it is lazy and keyed, derived collections are
+      memoized, and it was checked on a device with 100+ items.
+- [ ] **If this claims a speedup:** a before/after number is included, measured on a
+      physical device in a release build, 3+ iterations, median or p95 reported. "Feels
+      faster" is not a measurement.
+- [ ] **If a threshold or baseline moved:** say so explicitly and justify it.
+
+<!-- Answer "yes", "no — not applicable", or explain. Don't just delete a line. -->
+
 ## Parity checklist
 
 > This project maintains a feature-parity table in [PARITY.md](../PARITY.md) that

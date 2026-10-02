@@ -34,6 +34,15 @@ val sentryDsn = System.getenv("SENTRY_DSN")?.takeIf { it.isNotBlank() }
     ?: (project.findProperty("sentry.dsn") as String?)?.takeIf { it.isNotBlank() }
     ?: ""
 
+// #464: Google Play requires every upload's versionCode to be strictly higher than any
+// previous one. The release pipeline (android/fastlane/Fastfile) computes it from Google
+// Play (highest versionCode on any track + 1) and passes it in here; local and debug
+// builds keep the default of 1.
+val playVersionCode = System.getenv("ETHOS_VERSION_CODE")?.takeIf { it.isNotBlank() }?.let {
+    it.toIntOrNull()?.takeIf { code -> code in 1..2_100_000_000 }
+        ?: throw GradleException("ETHOS_VERSION_CODE must be an integer from 1 to 2100000000, got '$it'")
+}
+
 val releaseKeystorePath = signingProp("ANDROID_KEYSTORE_PATH", "ANDROID_KEYSTORE_PATH")
 val releaseKeystorePassword = signingProp("ANDROID_KEYSTORE_PASSWORD", "ANDROID_KEYSTORE_PASSWORD")
 val releaseKeyAlias = signingProp("ANDROID_KEY_ALIAS", "ANDROID_KEY_ALIAS")
@@ -51,7 +60,7 @@ android {
         applicationId = "com.ethosprotocol"
         minSdk = 28
         targetSdk = 35
-        versionCode = 1
+        versionCode = playVersionCode ?: 1
         versionName = "1.0.0"
         // Enable multidex to support large dependency trees that exceed the 64K method
         // reference limit per dex file (#430). minSdk = 28 (API 28+) means the platform

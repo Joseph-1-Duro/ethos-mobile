@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Generate App Store "What's New" text from conventional-commit history.
+"""Generate store "What's New" text from conventional-commit history.
 
 Used by the iOS release lanes (ios/EthosProtocol/fastlane/Fastfile) to produce
-the TestFlight "What to Test" changelog and the App Store "What's New" text
-for every locale in the store listing. See docs/ios-app-store-release.md.
+the TestFlight "What to Test" changelog and the App Store "What's New" text,
+and by the Android lanes (android/fastlane/Fastfile, ``--platform android``)
+for the Google Play release notes, for every locale in the store listing.
+See docs/ios-app-store-release.md and docs/android-play-store-release.md.
 
 Rules (deterministic, covered by tests/test_generate_release_notes.py):
 
@@ -14,13 +16,15 @@ Rules (deterministic, covered by tests/test_generate_release_notes.py):
 * Only user-facing conventional-commit types are kept: ``feat`` (New),
   ``perf`` (Improvements) and ``fix`` (Fixes). Everything else (chore, ci,
   test, docs, build, refactor, style, non-conventional subjects) is dropped.
-* Entries scoped only to Android (``fix(android): ...``) are dropped, since
-  these notes ship with the iOS build.
+* Entries scoped only to the other platform are dropped: ``fix(android): ...``
+  for ``--platform ios`` (the default), ``fix(ios): ...`` for
+  ``--platform android``.
 * Issue/PR references (``#123``) are stripped; entries with fewer than two
   words left (e.g. "fix: address #1, #2") carry no user-facing meaning and
   are dropped. Duplicates are collapsed.
-* The text is trimmed to the App Store limit (4000 characters) by dropping
-  whole bullets from the end, never by cutting a sentence mid-way.
+* The text is trimmed to the store limit (App Store: 4000 characters,
+  Google Play: 500 per locale) by dropping whole bullets from the end, never
+  by cutting a sentence mid-way.
 * Overrides win over generated text: a per-locale override file
   (``<override-dir>/<locale>.txt``) beats a global override
   (``--override-file``), which beats generated text. Locales without their
@@ -31,7 +35,8 @@ Usage:
     generate_release_notes.py --output-dir build/release_notes \\
         [--from-ref v1.2.0 | --tag-pattern 'v[0-9]*'] [--to-ref HEAD] \\
         [--metadata-dir fastlane/metadata] [--default-locale en-US] \\
-        [--override-file notes.txt] [--override-dir fastlane/release_notes/1.3.0]
+        [--override-file notes.txt] [--override-dir fastlane/release_notes/1.3.0] \\
+        [--platform ios|android]
 """
 from __future__ import annotations
 
@@ -45,6 +50,10 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 APP_STORE_LIMIT = 4000
+GOOGLE_PLAY_LIMIT = 500
+# Character limit of the release notes field, per --platform.
+PLATFORM_LIMITS = {"ios": APP_STORE_LIMIT, "android": GOOGLE_PLAY_LIMIT}
+DEFAULT_PLATFORM = "ios"
 DEFAULT_LOCALE = "en-US"
 DEFAULT_TAG_PATTERN = "v[0-9]*"
 EMPTY_NOTES = "Bug fixes and performance improvements."
@@ -67,7 +76,9 @@ OTHER_MERGE_RE = re.compile(r"^Merge (branch|remote-tracking branch|tag) ")
 ISSUE_REF_RE = re.compile(
     r"\(?#\d+\)?(?:[\s,&]+(?:and\s+)?\(?#\d+\)?)*(?:\s*[—–:-]\s+)?"
 )
-LOCALE_DIR_RE = re.compile(r"^[a-z]{2,3}(-[A-Za-z]{2,4})?$")
+# Store locale folder names: "en-US", "zh-Hans", and Google Play's numeric
+# regions such as "es-419".
+LOCALE_DIR_RE = re.compile(r"^[a-z]{2,3}(-([A-Za-z]{2,4}|\d{3}))?$")
 
 
 @dataclass(frozen=True)
@@ -106,14 +117,16 @@ def clean_description(desc: str) -> str:
     return text
 
 
-def is_android_only(scope: str | None) -> bool:
+def is_other_platform_only(scope: str | None, platform: str = DEFAULT_PLATFORM) -> bool:
+    """True for a scope naming only the platform these notes are NOT for."""
     if not scope:
         return False
     scopes = {s.strip().lower() for s in re.split(r"[,/ ]+", scope) if s.strip()}
-    return "android" in scopes and "ios" not in scopes
+    others = set(PLATFORM_LIMITS) - {platform}
+    return bool(scopes & others) and platform not in scopes
 
 
-def classify(commit: Commit) -> Entry | None:
+def classify(commit: Commit, platform: str = DEFAULT_PLATFORM) -> Entry | None:
     title = pr_title(commit)
     if not title:
         return None
@@ -121,7 +134,7 @@ def classify(commit: Commit) -> Entry | None:
     if not match:
         return None
     kind = match.group("type").lower()
-    if kind not in SECTIONS or is_android_only(match.group("scope")):
+    if kind not in SECTIONS or is_other_platform_only(match.group("scope"), platform):
         return None
     text = clean_description(match.group("desc"))
     if len(text.split()) < 2:
@@ -129,11 +142,12 @@ def classify(commit: Commit) -> Entry | None:
     return Entry(section=SECTIONS[kind], text=text)
 
 
-def collect_entries(commits: Iterable[Commit]) -> list[Entry]:
+def collect_entries(commits: Iterable[Commit],
+                    platform: str = DEFAULT_PLATFORM) -> list[Entry]:
     seen: set[str] = set()
     entries: list[Entry] = []
     for commit in commits:
-        entry = classify(commit)
+        entry = classify(commit, platform)
         if entry is None:
             continue
         key = entry.text.casefold()
@@ -175,7 +189,7 @@ def check_length(text: str, source: str, limit: int) -> str:
         raise ValueError(f"{source} is empty")
     if len(text) > limit:
         raise ValueError(
-            f"{source} is {len(text)} characters; the App Store limit is {limit}"
+            f"{source} is {len(text)} characters; the store limit is {limit}"
         )
     return text
 
@@ -268,14 +282,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--locales", default="",
                         help="Comma-separated locales in addition to the default "
                         "and any found in --metadata-dir.")
-    parser.add_argument("--metadata-dir", help="fastlane deliver metadata directory; "
-                        "each <locale>/ subdirectory gets release notes.")
+    parser.add_argument("--metadata-dir", help="fastlane deliver/supply metadata "
+                        "directory; each <locale>/ subdirectory gets release notes.")
     parser.add_argument("--override-file", help="Use this text for every locale "
                         "instead of the generated notes.")
     parser.add_argument("--override-dir", help="Directory of <locale>.txt files "
                         "that override individual locales.")
-    parser.add_argument("--max-length", type=int, default=APP_STORE_LIMIT)
+    parser.add_argument("--platform", choices=sorted(PLATFORM_LIMITS),
+                        default=DEFAULT_PLATFORM,
+                        help="Store the notes are for: sets the default length limit "
+                        "and drops entries scoped only to the other platform.")
+    parser.add_argument("--max-length", type=int,
+                        help="Defaults to the platform's store limit "
+                        f"(ios {APP_STORE_LIMIT}, android {GOOGLE_PLAY_LIMIT}).")
     args = parser.parse_args(argv)
+    if args.max_length is None:
+        args.max_length = PLATFORM_LIMITS[args.platform]
 
     if args.log_file:
         commits = commits_from_file(args.log_file)
@@ -287,7 +309,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                   "release notes override for the first release.", file=sys.stderr)
         commits = commits_from_git(from_ref, args.to_ref)
 
-    generated = build_notes(collect_entries(commits), limit=args.max_length)
+    generated = build_notes(collect_entries(commits, args.platform), limit=args.max_length)
     override_text = None
     if args.override_file:
         override_text = Path(args.override_file).read_text(encoding="utf-8")

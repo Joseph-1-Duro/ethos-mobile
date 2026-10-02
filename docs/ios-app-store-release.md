@@ -4,10 +4,10 @@ Automates App Store Connect submission for the iOS app (#463): signed build, Tes
 upload, "What's New" generation, store listing/screenshot upload, and App Review submission.
 
 - Workflow: [`.github/workflows/ios-app-store-release.yml`](../.github/workflows/ios-app-store-release.yml)
-- Lanes: [`ios/EthosProtocol/fastlane/Fastfile`](../ios/EthosProtocol/fastlane/Fastfile) (fastlane 2.240.1, Ruby 3.3.12, both pinned)
+- Lanes: [`ios/EthosProtocol/fastlane/Fastfile`](../ios/EthosProtocol/fastlane/Fastfile) (fastlane 2.240.1 and Ruby 3.3.12, pinned in the repo-root `Gemfile`/`.ruby-version` shared with Android)
 - Release notes: [`.github/scripts/generate_release_notes.py`](../.github/scripts/generate_release_notes.py) (tests in `.github/scripts/tests/`, run by iOS CI)
 
-Android / Play Store is not covered yet (see [Follow-ups](#follow-ups)).
+Android / Google Play has its own pipeline: [android-play-store-release.md](android-play-store-release.md).
 
 ## How a release flows
 
@@ -253,7 +253,6 @@ refused until each is `true` or `false`:
 
 ## Follow-ups
 
-- Android / Google Play automation (fastlane `supply` or Gradle Play Publisher), mirroring this flow.
 - Screenshot generation (`fastlane snapshot` driven by the existing XCUITest suite).
 - Create a GitHub Release from the tag with the generated notes. That would also feed
   `release-notes-parity-check.yml`, which runs on published releases (needs `contents: write`).

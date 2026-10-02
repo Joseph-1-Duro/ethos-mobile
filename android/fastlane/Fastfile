@@ -1,0 +1,385 @@
+# frozen_string_literal: true
+
+# Google Play release automation (#464). The flow, every secret and the maintainer
+# checklist are documented in docs/android-play-store-release.md.
+#
+#   bundle exec fastlane android validate                      # no credentials, no uploads
+#   bundle exec fastlane android internal dry_run:true         # validate + release bundle build
+#   bundle exec fastlane android internal                      # build, sign, upload to the internal track
+#   bundle exec fastlane android production version_code:42 rollout:0.1
+#   bundle exec fastlane android rollout action:increase rollout:0.5   # or complete / halt
+#
+# Every lane accepts dry_run:true: all local validation runs and the plan is
+# printed, then it stops before the first call that needs credentials.
+
+require "base64"
+require "fileutils"
+require "json"
+require "open3"
+
+default_platform(:android)
+
+# fastlane evaluates this file from fastlane/ but runs actions from its parent,
+# so every path handed to an action is absolute.
+FASTLANE_DIR = File.expand_path(__dir__)
+ANDROID_ROOT = File.expand_path("..", FASTLANE_DIR)
+REPO_ROOT = File.expand_path("..", ANDROID_ROOT)
+APP_GRADLE = File.join(ANDROID_ROOT, "app", "build.gradle.kts")
+METADATA_DIR = File.join(FASTLANE_DIR, "metadata", "android")
+RELEASE_NOTES_OVERRIDE_DIR = File.join(FASTLANE_DIR, "release_notes")
+# `build/` is git-ignored.
+OUTPUT_DIR = File.join(ANDROID_ROOT, "build", "fastlane")
+RELEASE_NOTES_SCRIPT = File.join(REPO_ROOT, ".github", "scripts", "generate_release_notes.py")
+CERT_PINS_SCRIPT = File.join(REPO_ROOT, ".github", "scripts", "verify_cert_pins.py")
+RELEASE_BUILD_CONFIG = File.join(ANDROID_ROOT, "app", "build", "generated", "source", "buildConfig",
+                                 "release", "com", "ethosprotocol", "BuildConfig.java")
+CERT_PINNING_SOURCE = File.join(ANDROID_ROOT, "app", "src", "main", "java", "com", "ethosprotocol",
+                                "api", "CertificatePinning.kt")
+
+DEFAULT_LOCALE = ENV.fetch("PLAY_DEFAULT_LOCALE", "en-US")
+TAG_PREFIX = "v"
+INTERNAL_TRACK = "internal"
+PRODUCTION_TRACK = "production"
+# Tracks scanned for the highest versionCode already on Google Play.
+VERSION_CODE_TRACKS = %w[internal alpha beta production].freeze
+MAX_VERSION_CODE = 2_100_000_000
+ROLLOUT_ACTIONS = %w[increase complete halt].freeze
+
+PLAY_ENV = %w[PLAY_SERVICE_ACCOUNT_JSON_BASE64].freeze
+SIGNING_ENV = %w[ANDROID_KEYSTORE_PATH ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD].freeze
+BUILD_ENV = %w[ETHOS_CERT_PINS].freeze
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def truthy?(value)
+  %w[true 1 yes].include?(value.to_s.strip.downcase)
+end
+
+def missing_env(names)
+  names.reject { |name| ENV[name].to_s.strip != "" }
+end
+
+def require_env!(names)
+  missing = missing_env(names)
+  return if missing.empty?
+
+  UI.user_error!("Missing required secrets/variables: #{missing.join(', ')}. " \
+                 "See docs/android-play-store-release.md#secrets-and-variables.")
+end
+
+def github_output(values)
+  return unless ENV["GITHUB_OUTPUT"]
+
+  File.open(ENV["GITHUB_OUTPUT"], "a") { |f| values.each { |k, v| f.puts("#{k}=#{v}") } }
+end
+
+def step_summary(markdown)
+  return unless ENV["GITHUB_STEP_SUMMARY"]
+
+  File.open(ENV["GITHUB_STEP_SUMMARY"], "a") { |f| f.puts(markdown, "") }
+end
+
+# Package name and versionName come from app/build.gradle.kts (single source of
+# truth); the versionCode is computed per upload.
+def release_info
+  gradle = File.read(APP_GRADLE)
+  package_name = gradle[/applicationId\s*=\s*"([^"]+)"/, 1]
+  version = gradle[/versionName\s*=\s*"([^"]+)"/, 1]
+  UI.user_error!("Could not read applicationId from #{APP_GRADLE}") if package_name.to_s.empty?
+  unless version.to_s.match?(/\A\d+\.\d+\.\d+\z/)
+    UI.user_error!("versionName '#{version}' in app/build.gradle.kts is not X.Y.Z")
+  end
+  { package_name: package_name, version: version }
+end
+
+# A tag-triggered release must build exactly the version the tag names. Tags are
+# shared with the iOS release, so both apps carry the same X.Y.Z.
+def check_release_tag!(version)
+  tag = ENV["RELEASE_TAG"].to_s
+  return if tag.empty?
+  return if tag == "#{TAG_PREFIX}#{version}"
+
+  UI.user_error!("Tag #{tag} does not match versionName #{version} in android/app/build.gradle.kts. " \
+                 "Bump versionName in a commit, then tag that commit #{TAG_PREFIX}#{version}.")
+end
+
+def generate_release_notes(version)
+  out_dir = File.join(OUTPUT_DIR, "release_notes")
+  FileUtils.rm_rf(out_dir)
+  args = ["python3", RELEASE_NOTES_SCRIPT,
+          "--platform", "android",
+          "--output-dir", out_dir,
+          "--tag-pattern", "#{TAG_PREFIX}[0-9]*",
+          "--default-locale", DEFAULT_LOCALE,
+          "--metadata-dir", METADATA_DIR]
+
+  override_dir = File.join(RELEASE_NOTES_OVERRIDE_DIR, version)
+  args += ["--override-dir", override_dir] if File.directory?(override_dir)
+
+  # Workflow input. Written to a file rather than passed on the command line.
+  override_text = ENV["RELEASE_NOTES_OVERRIDE"].to_s
+  unless override_text.strip.empty?
+    override_file = File.join(OUTPUT_DIR, "release_notes_override.txt")
+    FileUtils.mkdir_p(OUTPUT_DIR)
+    File.write(override_file, override_text)
+    args += ["--override-file", override_file]
+  end
+
+  sh(*args, log: false)
+  notes = Dir[File.join(out_dir, "*.txt")].sort.to_h do |path|
+    [File.basename(path, ".txt"), File.read(path).strip]
+  end
+  UI.header("Release notes (#{DEFAULT_LOCALE}, #{notes[DEFAULT_LOCALE].length}/500 chars)")
+  UI.message(notes[DEFAULT_LOCALE])
+  notes
+end
+
+# Locale folders must be Google Play language codes (supply's own list, which
+# spells them with underscores: de_DE, es_419).
+def validate_metadata
+  require "supply"
+  locales = Dir[File.join(METADATA_DIR, "*")].select { |p| File.directory?(p) }.map { |p| File.basename(p) }
+  unknown = locales.reject { |locale| Supply::Languages::ALL_LANGUAGES.include?(locale.tr("-", "_")) }
+  UI.user_error!("Unsupported Google Play locale folder(s) in #{METADATA_DIR}: #{unknown.join(', ')}") unless unknown.empty?
+  UI.message("Play listing locales: #{locales.empty? ? "none (release notes for #{DEFAULT_LOCALE} only)" : locales.join(', ')}")
+  locales
+end
+
+def rollout_fraction(value, allow_full: false)
+  text = value.to_s.strip
+  fraction = Float(text, exception: false)
+  upper_ok = allow_full ? fraction.to_f <= 1 : fraction.to_f < 1
+  unless fraction && fraction > 0 && upper_ok
+    UI.user_error!("rollout must be a fraction #{allow_full ? '0 < f <= 1' : '0 < f < 1'} (e.g. 0.1 for 10%), got '#{text}'")
+  end
+  fraction
+end
+
+def report_credentials(names)
+  missing = missing_env(names)
+  if missing.empty?
+    UI.success("All required secrets/variables are present (values not shown)")
+  else
+    UI.important("Not configured in this environment: #{missing.join(', ')}")
+  end
+end
+
+# The service-account key stays in memory: decoded from the secret and handed
+# to supply as json_key_data, never written to disk.
+def play_json_key
+  require_env!(PLAY_ENV)
+  json = Base64.decode64(ENV.fetch("PLAY_SERVICE_ACCOUNT_JSON_BASE64"))
+  parsed = JSON.parse(json) rescue nil
+  unless parsed.is_a?(Hash) && parsed["type"] == "service_account" && parsed["client_email"]
+    UI.user_error!("PLAY_SERVICE_ACCOUNT_JSON_BASE64 is not a base64-encoded service account JSON key")
+  end
+  json
+end
+
+def next_version_code(info, json_key)
+  override = ENV["VERSION_CODE"].to_s.strip
+  return Integer(override) unless override.empty?
+
+  highest = VERSION_CODE_TRACKS.flat_map do |track|
+    google_play_track_version_codes(package_name: info[:package_name], track: track, json_key_data: json_key)
+  end.map(&:to_i).max || 0
+  code = highest + 1
+  UI.user_error!("versionCode #{code} exceeds Google Play's maximum #{MAX_VERSION_CODE}") if code > MAX_VERSION_CODE
+  code
+end
+
+def build_bundle(version_code: nil)
+  ENV["ETHOS_VERSION_CODE"] = version_code.to_s if version_code
+  gradle(
+    task: "bundle",
+    build_type: "Release",
+    project_dir: ANDROID_ROOT,
+    gradle_path: File.join(ANDROID_ROOT, "gradlew"),
+    flags: "--no-daemon --console=plain"
+  )
+  lane_context[SharedValues::GRADLE_AAB_OUTPUT_PATH] || UI.user_error!("bundleRelease produced no .aab")
+end
+
+# The same gate android-ci.yml runs: no placeholder or missing pins in a release build.
+def verify_release_pins!(strict:)
+  args = ["python3", CERT_PINS_SCRIPT, "--build-type", "release",
+          "--build-config", RELEASE_BUILD_CONFIG, "--source", CERT_PINNING_SOURCE]
+  args << "--warn-if-unconfigured" unless strict
+  sh(*args)
+end
+
+# Returns the signer's certificate owner, or nil for an unsigned bundle.
+def bundle_signer(aab)
+  out, = Open3.capture2e("keytool", "-printcert", "-jarfile", aab)
+  out[/Owner: (.+)/, 1]
+end
+
+# supply reads changelogs from <metadata>/<locale>/changelogs/<versionCode>.txt.
+# Only changelogs go in this directory, so the store listing is never touched.
+def changelog_metadata(notes, version_code)
+  dir = File.join(OUTPUT_DIR, "play_metadata")
+  FileUtils.rm_rf(dir)
+  notes.each do |locale, text|
+    path = File.join(dir, locale, "changelogs", "#{version_code}.txt")
+    FileUtils.mkdir_p(File.dirname(path))
+    File.write(path, "#{text}\n")
+  end
+  dir
+end
+
+def empty_metadata_dir
+  dir = File.join(OUTPUT_DIR, "empty_metadata")
+  FileUtils.mkdir_p(dir)
+  dir
+end
+
+# Options shared by every call that must not touch binaries or the listing.
+def play_no_upload_options
+  {
+    skip_upload_apk: true, skip_upload_aab: true, skip_upload_metadata: true,
+    skip_upload_changelogs: true, skip_upload_images: true, skip_upload_screenshots: true,
+    metadata_path: empty_metadata_dir
+  }
+end
+
+def changes_not_sent_for_review
+  truthy?(ENV["PLAY_CHANGES_NOT_SENT_FOR_REVIEW"])
+end
+
+# ── lanes ────────────────────────────────────────────────────────────────────
+
+platform :android do
+  desc "Validate the release configuration. Needs no credentials and uploads nothing."
+  desc "Options: rollout:0.1 also validates a staged-rollout fraction."
+  lane :validate do |options|
+    info = release_info
+    check_release_tag!(info[:version])
+    UI.message("#{info[:package_name]} #{info[:version]}")
+    rollout_fraction(options[:rollout], allow_full: true) if options[:rollout]
+    notes = generate_release_notes(info[:version])
+    locales = validate_metadata
+    report_credentials(PLAY_ENV + SIGNING_ENV + BUILD_ENV)
+    info.merge(release_notes: notes, locales: locales)
+  end
+
+  desc "Build the signed release bundle (AAB) and upload it to the internal testing track."
+  desc "Options: dry_run:true builds the bundle (signed only if signing env is present) and stops before Google Play."
+  lane :internal do |options|
+    dry_run = truthy?(options[:dry_run])
+    info = validate
+
+    if dry_run
+      aab = build_bundle(version_code: ENV["VERSION_CODE"].to_s.strip.empty? ? nil : ENV["VERSION_CODE"])
+      verify_release_pins!(strict: false)
+      signer = bundle_signer(aab)
+      UI.message("Bundle: #{aab} (#{signer ? "signed by #{signer}" : 'UNSIGNED: no upload keystore configured'})")
+      UI.important("DRY RUN: stopping before Google Play. Would upload #{info[:version]} " \
+                   "to the #{INTERNAL_TRACK} track with the release notes above.")
+      github_output(version: info[:version], version_code: "", dry_run: true)
+      step_summary("### Google Play internal track (dry run)\nBuilt #{File.basename(aab)} for " \
+                   "#{info[:version]}; nothing was uploaded.")
+      next
+    end
+
+    require_env!(PLAY_ENV + SIGNING_ENV + BUILD_ENV)
+    json_key = play_json_key
+    version_code = next_version_code(info, json_key)
+    UI.message("Building #{info[:version]} (versionCode #{version_code})")
+
+    aab = build_bundle(version_code: version_code)
+    verify_release_pins!(strict: true)
+    signer = bundle_signer(aab) || UI.user_error!("#{aab} is not signed; check the upload keystore secrets")
+    UI.success("Bundle signed by #{signer}")
+
+    mapping = lane_context[SharedValues::GRADLE_MAPPING_TXT_OUTPUT_PATH]
+    upload_to_play_store(
+      package_name: info[:package_name],
+      json_key_data: json_key,
+      track: INTERNAL_TRACK,
+      # An app that has never been published only accepts draft releases.
+      release_status: ENV.fetch("PLAY_INTERNAL_RELEASE_STATUS", "completed"),
+      aab: aab,
+      mapping: mapping && File.exist?(mapping) ? mapping : nil,
+      metadata_path: changelog_metadata(info[:release_notes], version_code),
+      skip_upload_apk: true,
+      skip_upload_metadata: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true,
+      changes_not_sent_for_review: changes_not_sent_for_review
+    )
+
+    github_output(version: info[:version], version_code: version_code, dry_run: false)
+    step_summary("### Google Play internal track\nUploaded #{info[:version]} (versionCode #{version_code}).")
+  end
+
+  desc "Promote a versionCode from the internal track to production as a staged rollout."
+  desc "Options: version_code:N rollout:0.1 (1 = full release) dry_run:true"
+  lane :production do |options|
+    dry_run = truthy?(options[:dry_run])
+    version_code = options[:version_code].to_s.strip
+    fraction = rollout_fraction(options[:rollout] || "0.1", allow_full: true)
+    UI.user_error!("version_code:<the internal build to promote> is required") if version_code.empty? && !dry_run
+    info = release_info
+
+    plan = "promote versionCode #{version_code.empty? ? '<from the internal upload>' : version_code} " \
+           "from #{INTERNAL_TRACK} to #{PRODUCTION_TRACK} at #{(fraction * 100).round(2)}%" \
+           "#{fraction < 1 ? ' (staged rollout, inProgress)' : ' (full release)'}"
+    if dry_run
+      UI.important("DRY RUN: would #{plan}. Stopping before Google Play.")
+      step_summary("### Google Play production (dry run)\nWould #{plan}.")
+      next
+    end
+
+    upload_to_play_store(
+      package_name: info[:package_name],
+      json_key_data: play_json_key,
+      track: INTERNAL_TRACK,
+      track_promote_to: PRODUCTION_TRACK,
+      track_promote_release_status: "completed",
+      version_code: version_code,
+      rollout: fraction.to_s,
+      changes_not_sent_for_review: changes_not_sent_for_review,
+      **play_no_upload_options
+    )
+    step_summary("### Google Play production\nDone: #{plan}.")
+  end
+
+  desc "Manage the production staged rollout: increase it, complete it (100%), or halt it."
+  desc "Options: action:increase|complete|halt rollout:0.5 (required for increase/halt) dry_run:true"
+  lane :rollout do |options|
+    dry_run = truthy?(options[:dry_run])
+    action = options[:action].to_s.strip
+    UI.user_error!("action must be one of #{ROLLOUT_ACTIONS.join(', ')}, got '#{action}'") unless ROLLOUT_ACTIONS.include?(action)
+    info = release_info
+
+    play_options = { track: PRODUCTION_TRACK }
+    case action
+    when "increase"
+      fraction = rollout_fraction(options[:rollout])
+      play_options.merge!(rollout: fraction.to_s, release_status: "inProgress")
+      plan = "raise the production rollout to #{(fraction * 100).round(2)}%"
+    when "complete"
+      play_options.merge!(rollout: "1", release_status: "completed")
+      plan = "complete the production rollout (100% of users)"
+    when "halt"
+      # Play keeps a user fraction on halted releases; pass the current one.
+      fraction = rollout_fraction(options[:rollout])
+      play_options.merge!(rollout: fraction.to_s, release_status: "halted")
+      plan = "halt the production rollout (kept at #{(fraction * 100).round(2)}% for a later resume in Play Console)"
+    end
+
+    if dry_run
+      UI.important("DRY RUN: would #{plan}. Stopping before Google Play.")
+      step_summary("### Google Play rollout (dry run)\nWould #{plan}.")
+      next
+    end
+
+    upload_to_play_store(
+      package_name: info[:package_name],
+      json_key_data: play_json_key,
+      changes_not_sent_for_review: changes_not_sent_for_review,
+      **play_no_upload_options.merge(play_options)
+    )
+    step_summary("### Google Play rollout\nDone: #{plan}.")
+  end
+end

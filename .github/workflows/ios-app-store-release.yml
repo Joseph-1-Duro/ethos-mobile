@@ -172,7 +172,8 @@ jobs:
       - name: Set up Ruby and fastlane (cached)
         uses: ruby/setup-ruby@v1
         with:
-          working-directory: ios/EthosProtocol
+          # Gemfile, Gemfile.lock and .ruby-version live at the repo root
+          # (shared with the Android release workflow).
           bundler-cache: true
 
       - name: Install XcodeGen
@@ -228,7 +229,8 @@ jobs:
       - name: Set up Ruby and fastlane (cached)
         uses: ruby/setup-ruby@v1
         with:
-          working-directory: ios/EthosProtocol
+          # Gemfile, Gemfile.lock and .ruby-version live at the repo root
+          # (shared with the Android release workflow).
           bundler-cache: true
 
       - name: Update App Store version (fastlane ios app_store)

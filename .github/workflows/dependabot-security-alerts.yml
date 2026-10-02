@@ -1,0 +1,158 @@
+# #466 — Security alert notifications.
+#
+# Daily check of this repository's open Dependabot security alerts, with a
+# persistent GitHub issue as the notification channel:
+#
+#   - Alerts found  -> open (or refresh) an issue titled
+#     "🚨 Open Dependabot security alerts" summarising every open alert.
+#     The issue body is updated in place on later runs, so a lingering alert
+#     does not generate a comment per day.
+#   - No alerts     -> if the issue exists, post an all-clear comment and
+#     close it. New alerts re-create the issue on the next run.
+#
+# This mirrors the scheduled-scan alerting convention already used by
+# android-dependency-check.yml / ios-dependency-check.yml (which file issues
+# such as #531/#370 on scheduled failures) and extends it to Dependabot's own
+# advisory database.
+#
+# The endpoint used here returns 403 unless BOTH of these hold (checked in
+# order when the run fails):
+#   1. Dependabot alerts are enabled for the repository
+#      (Settings > Code security > Dependabot alerts).
+#   2. The workflow token may read them: Settings > Actions > General >
+#      Workflow permissions > "Read permission for security events" — or an
+#      explicit `alerts: read` grant where workflow permissions are set per
+#      workflow. (The default read-only GITHUB_TOKEN alone is not enough;
+#      see docs.github.com "REST API endpoints for Dependabot alerts".)
+name: Dependabot Security Alert Notifications
+
+on:
+  schedule:
+    # 07:00 UTC daily — after the Monday 06:00 dependency-check scans so the
+    # notification always reflects this week's fresh scan results.
+    - cron: "0 7 * * *"
+  workflow_dispatch: # allow manual re-runs for testing
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  ISSUE_TITLE: "🚨 Open Dependabot security alerts"
+
+jobs:
+  notify-open-alerts:
+    name: Notify on open security alerts
+    runs-on: ubuntu-latest
+
+    steps:
+      # Purely API-driven: no repository checkout is needed.
+
+      - name: Fetch open Dependabot alerts
+        id: alerts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if ! gh api "repos/${GITHUB_REPOSITORY}/dependabot/alerts?state=open&per_page=100" --paginate > alerts.json 2> alerts_error.txt; then
+            if grep -qE "HTTP 403|Resource not accessible by integration" alerts_error.txt; then
+              echo "::error::Could not read Dependabot alerts (HTTP 403). Fix one of:"
+              echo "::error::1. Enable Dependabot alerts: Settings > Code security > Dependabot alerts."
+              echo "::error::2. Allow the workflow token to read security events: Settings > Actions > General > Workflow permissions > 'Read permission for security events'."
+            fi
+            cat alerts_error.txt >&2
+            exit 1
+          fi
+
+          COUNT=$(jq 'length' alerts.json)
+          CRITICAL=$(jq '[.[] | select(.security_advisory.severity == "critical")] | length' alerts.json)
+          HIGH=$(jq '[.[] | select(.security_advisory.severity == "high")] | length' alerts.json)
+          MEDIUM=$(jq '[.[] | select(.security_advisory.severity == "medium")] | length' alerts.json)
+          LOW=$(jq '[.[] | select(.security_advisory.severity == "low")] | length' alerts.json)
+
+          {
+            echo "count=${COUNT}"
+            echo "critical=${CRITICAL}"
+            echo "high=${HIGH}"
+            echo "medium=${MEDIUM}"
+            echo "low=${LOW}"
+          } >> "$GITHUB_OUTPUT"
+
+          # Markdown table rows, sorted critical -> high -> medium -> low.
+          jq -r 'sort_by({"critical":0,"high":1,"medium":2,"low":3}[.security_advisory.severity] // 9) | .[] | "| [\(.number)](\(.html_url)) | \(.dependency.package.ecosystem // "n/a") | `\(.dependency.package.name)` | \(.security_advisory.severity) | `\(.dependency.manifest_path)` | \(.security_vulnerability.first_patched_version.identifier // "none yet") |"' alerts.json > alert_rows.md
+
+          {
+            echo "## 🚨 Open Dependabot security alerts"
+            echo ""
+            echo "| Severity | Count |"
+            echo "|----------|-------|"
+            echo "| Critical | $CRITICAL |"
+            echo "| High     | $HIGH |"
+            echo "| Medium   | $MEDIUM |"
+            echo "| Low      | $LOW |"
+            echo ""
+            echo "### Alerts"
+            echo ""
+            echo "| Alert | Ecosystem | Package | Severity | Manifest | First patched |"
+            echo "|-------|-----------|---------|----------|----------|---------------|"
+            cat alert_rows.md
+            echo ""
+            echo "Automated daily report — this issue is updated in place; it is closed automatically once all alerts are resolved."
+            echo ""
+            echo "To resolve: apply the first patched version listed above (Dependabot version updates and the weekly OWASP/osv scans see these too — see \`.github/dependabot.yml\` and #466)."
+          } > body.md
+
+      - name: Write run summary
+        if: always() && steps.alerts.outputs.count != ''
+        run: |
+          if [ "${{ steps.alerts.outputs.count }}" = "0" ]; then
+            echo "✅ No open Dependabot security alerts." >> "$GITHUB_STEP_SUMMARY"
+          else
+            cat body.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: File or refresh the notification issue
+        if: ${{ steps.alerts.outputs.count != '0' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Find an existing open notification issue by exact title among
+          # issues created by this workflow's token (github-actions[bot]).
+          # Uses the issues list API (creator filter) instead of the search
+          # API, so there is no search-index lag to race against.
+          ISSUE=$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&creator=app%2Fgithub-actions%5Bbot%5D&per_page=100" \
+            --jq '[.[] | select(.title == "🚨 Open Dependabot security alerts")][0].number // empty')
+
+          if [ -n "$ISSUE" ]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/${ISSUE}" \
+              -f body="$(cat body.md)" --silent
+            echo "Refreshed existing notification issue #${ISSUE}."
+          else
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues" \
+              -f title="🚨 Open Dependabot security alerts" \
+              -f body="$(cat body.md)" \
+              -f "labels[]=security" --silent
+            echo "Created new notification issue."
+          fi
+
+      - name: Close the notification issue when resolved
+        if: ${{ steps.alerts.outputs.count == '0' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          ISSUE=$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&creator=app%2Fgithub-actions%5Bbot%5D&per_page=100" \
+            --jq '[.[] | select(.title == "🚨 Open Dependabot security alerts")][0].number // empty') || ISSUE=""
+
+          if [ -n "$ISSUE" ]; then
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${ISSUE}/comments" \
+              -f body="All Dependabot security alerts are resolved — closing. This issue is re-created automatically if new alerts appear." --silent
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/${ISSUE}" -f state=closed --silent
+            echo "Closed notification issue #${ISSUE}."
+          else
+            echo "No open notification issue to close."
+          fi

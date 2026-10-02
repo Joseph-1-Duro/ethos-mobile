@@ -1,0 +1,74 @@
+# #466 — Auto-merge Dependabot patch updates.
+#
+# Scope is deliberately narrow: only Dependabot PRs whose dependency bump is a
+# SEMVER PATCH are auto-merged. Minor/major bumps and everything from humans
+# stays for manual review.
+#
+# Trigger model: standard `pull_request`. Dependabot opens PRs from same-repo
+# `dependabot/**` branches, so these events fire for them like for any other
+# PR — no pull_request_target needed, which keeps this workflow free of any
+# untrusted-code surface: it executes only GitHub-maintained actions and the
+# runner's gh CLI, and only flips the PR's auto-merge switch.
+#
+# Merge gate: dependabot's `wait-for-checks` waits for every status/required
+# check on the PR before merging. When branch protection on `main` requires
+# the `build-and-test` jobs, they gate the merge like any other PR. In
+# addition, this job declares the `github-actions` environment: if repo admins
+# protect that environment with a required reviewer, every auto-merge run
+# waits for that approval first — the recommended belt-and-braces for a
+# security-sensitive app (see SECURITY.md). If the environment is unprotected
+# the job runs without it and `wait-for-checks` remains the sole gate.
+name: Dependabot Auto-Merge
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  enable-auto-merge:
+    name: Enable auto-merge for patch updates
+    runs-on: ubuntu-latest
+    # Job-level filter: only Dependabot branches proceed. Human PRs show this
+    # job as skipped without spinning up a runner. Dependabot always branches
+    # as dependabot/**.
+    if: startsWith(github.event.pull_request.head.ref, 'dependabot/')
+    # See the header note: protecting this environment in repo settings adds a
+    # human approval gate in front of every auto-merge attempt.
+    environment: github-actions
+
+    steps:
+      - name: Check out pull request merge ref
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Derives update metadata (update-type, dependency-names, ...) from the
+      # Dependabot PR payload itself — no registry or alert API access needed.
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Skip non-patch updates
+        if: steps.metadata.outputs.update-type != 'version-update:semver-patch'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const type = '${{ steps.metadata.outputs.update-type }}' || 'unknown';
+            core.notice(`Update type is \`${type}\` — only patch bumps are auto-merged. This PR stays for manual review.`);
+
+      # The actual auto-merge. wait-for-checks: true holds the merge until all
+      # required checks on the PR are green (a no-op when none are required).
+      - name: Enable auto-merge (patch updates only)
+        if: steps.metadata.outputs.update-type == 'version-update:semver-patch'
+        uses: dependabot/enable-auto-merge@v2
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+          merge-method: "squash"
+          wait-for-checks: "true"
+          wait-for-checks-timeout: "90"

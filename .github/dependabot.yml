@@ -1,0 +1,70 @@
+# #466 — Dependency update automation.
+#
+# Dependabot needs no PAT or extra secrets: the default GITHUB_TOKEN (plus
+# Actions access to repos in this org, already used by every workflow here)
+# covers both ecosystems configured below. They are the repo's entire CI
+# dependency surface:
+#   - android/gradle/libs.versions.toml + wrapper properties (the paths
+#     android-dependency-check.yml already scans)
+#   - .github/workflows/*.yml action pins (25x checkout@v4, etc.)
+#
+# iOS Package.swift deliberately has no entry: it declares zero dependencies
+# (dependencies: []), so a `swift` entry would only produce "no files found"
+# warnings. Revisit if SPM dependencies are ever added.
+#
+# Labels use only names that already exist in this repo (android, ci) —
+# Dependabot skips configured labels it cannot find.
+version: 2
+updates:
+  # Gradle version catalog (android/gradle/libs.versions.toml) and the Gradle
+  # wrapper (gradle-wrapper.properties). Dependabot runs Gradle itself to bump
+  # wrapper files, so no manual regeneration is needed.
+  - package-ecosystem: "gradle"
+    directory: "/android"
+    schedule:
+      interval: "weekly"
+      # Same weekly slot as the dependency-check workflows (Monday 06:00 UTC
+      # scans): a Monday-morning PR batch lets the scheduled vulnerability
+      # scans see fresh dependency versions for the rest of the week.
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      # All AndroidX upgrades in one PR — they release in lockstep (lifecycle/
+      # navigation/datastore/biometric families) and are commonly co-bumped.
+      # Compose artifacts are excluded here and grouped separately below.
+      androidx:
+        patterns:
+          - "androidx.*"
+        exclude-patterns:
+          - "androidx.compose*"
+      # Compose BOM and its members travel together and deserve their own
+      # reviewable PR — a BOM bump can move every Compose artifact at once.
+      compose:
+        patterns:
+          - "androidx.compose*"
+      # All Kotlin/JetBrains artifacts in one PR (Kotlin, coroutines, serialization).
+      kotlin-jetbrains:
+        patterns:
+          - "org.jetbrains.*"
+    labels:
+      - "android"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+
+  # GitHub Actions version bumps across every workflow file. Kept separate from
+  # gradle so action bumps (low-risk, no build impact) and dependency bumps
+  # (build impact) are reviewed independently.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      # All first-party actions/* bumps in one PR (checkout, setup-java, ...).
+      github-actions:
+        patterns:
+          - "actions/*"
+    labels:
+      - "ci"

@@ -1,5 +1,10 @@
 # Security Policy
 
+> **Writing or reviewing code here?** Read
+> [docs/security-guidelines.md](docs/security-guidelines.md) first. It covers secure
+> coding practices, key management, authentication, and the security checklist to run
+> before opening a PR.
+
 ## Supported Versions
 
 We actively maintain and issue security fixes for the versions listed below.

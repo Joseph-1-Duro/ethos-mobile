@@ -9,6 +9,9 @@ This document describes the CI/CD workflow, build artifacts, release process, an
 > A `security.txt` (RFC 9116) is published at
 > [`/.well-known/security.txt`](.well-known/security.txt) and will also be served from
 > `https://ethos-protocol.app/.well-known/security.txt` once the domain is configured.
+>
+> **Contributing?** Read the [Security Guidelines](docs/security-guidelines.md) for secure
+> coding practices, key management, authentication rules, and the PR security checklist.
 
 [![iOS Coverage](https://codecov.io/gh/ethos-protocol/ethos-mobile/branch/main/graph/badge.svg?flag=ios)](https://codecov.io/gh/ethos-protocol/ethos-mobile?flag=ios)
 [![Android Coverage](https://codecov.io/gh/ethos-protocol/ethos-mobile/branch/main/graph/badge.svg?flag=android)](https://codecov.io/gh/ethos-protocol/ethos-mobile?flag=android)

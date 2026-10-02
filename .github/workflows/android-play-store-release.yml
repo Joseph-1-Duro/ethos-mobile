@@ -1,0 +1,267 @@
+name: Android Play Store Release
+
+# Builds the signed release bundle (AAB) with fastlane (android/fastlane/Fastfile)
+# and uploads it to Google Play's internal testing track. Promotion to production
+# (a staged rollout) and later rollout changes run only when requested AND
+# approved on the protected `play-production` environment.
+#
+# Setup, secrets and the first-run checklist: docs/android-play-store-release.md
+#
+# Triggers:
+#   - Tag vX.Y.Z (must equal versionName in android/app/build.gradle.kts; shared with
+#     the iOS release): real upload to the internal track. Promotion on tags only if
+#     the ANDROID_PROMOTE_TO_PRODUCTION_ON_TAG variable is "true".
+#   - Manual dispatch: dry run by default. rollout_action manages an existing
+#     production rollout (promote / increase / complete / halt) without building.
+#
+# Deliberately NOT triggered by pull_request: fork PRs get no secrets, and
+# nothing that uploads to Google Play may run from unreviewed code.
+#
+# Required secrets:  PLAY_SERVICE_ACCOUNT_JSON_BASE64, ANDROID_KEYSTORE_BASE64,
+#                    ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD,
+#                    ETHOS_CERT_PINS (already used by Android CI)
+# Optional secret:   SENTRY_DSN (compiled into release builds when set)
+# Optional variables: ANDROID_PROMOTE_TO_PRODUCTION_ON_TAG, PLAY_ROLLOUT_FRACTION,
+#                    PLAY_INTERNAL_RELEASE_STATUS, PLAY_CHANGES_NOT_SENT_FOR_REVIEW,
+#                    PLAY_DEFAULT_LOCALE
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: validate and build, upload nothing"
+        type: boolean
+        default: true
+      promote_to_production:
+        description: "After the internal upload, promote that build to production (waits for play-production approval)"
+        type: boolean
+        default: false
+      rollout_fraction:
+        description: "Production staged-rollout fraction (0.1 = 10%; 1 = everyone)"
+        type: string
+        default: "0.1"
+      rollout_action:
+        description: "Manage an existing release instead of building: promote (needs version_code), increase, complete, halt"
+        type: choice
+        default: none
+        options:
+          - none
+          - promote
+          - increase
+          - complete
+          - halt
+      version_code:
+        description: "versionCode on the internal track to promote (rollout_action: promote)"
+        type: string
+        default: ""
+      release_notes:
+        description: "Override What's new for every language (max 500 chars; empty = generate from commits)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+# One release at a time; a second tag waits instead of racing for versionCodes.
+concurrency:
+  group: android-play-store-release
+  cancel-in-progress: false
+
+env:
+  FASTLANE_SKIP_UPDATE_CHECK: "1"
+  FASTLANE_HIDE_CHANGELOG: "1"
+  FASTLANE_OPT_OUT_USAGE: "1"
+  LC_ALL: C.UTF-8
+  LANG: C.UTF-8
+  PLAY_DEFAULT_LOCALE: ${{ vars.PLAY_DEFAULT_LOCALE || 'en-US' }}
+  PLAY_CHANGES_NOT_SENT_FOR_REVIEW: ${{ vars.PLAY_CHANGES_NOT_SENT_FOR_REVIEW || 'false' }}
+
+jobs:
+  internal:
+    name: Build and upload to the internal track
+    if: github.event_name == 'push' || inputs.rollout_action == 'none'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: android
+    outputs:
+      version_code: ${{ steps.internal.outputs.version_code }}
+      promote: ${{ steps.options.outputs.promote }}
+      rollout_fraction: ${{ steps.options.outputs.rollout_fraction }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags: release notes cover the range since the previous tag.
+          fetch-depth: 0
+
+      - name: Resolve release options
+        id: options
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_PROMOTE: ${{ inputs.promote_to_production }}
+          INPUT_FRACTION: ${{ inputs.rollout_fraction }}
+          PROMOTE_ON_TAG: ${{ vars.ANDROID_PROMOTE_TO_PRODUCTION_ON_TAG }}
+          TAG_FRACTION: ${{ vars.PLAY_ROLLOUT_FRACTION }}
+        run: |
+          if [ "$EVENT" = "push" ]; then
+            dry_run=false
+            promote=$([ "$PROMOTE_ON_TAG" = "true" ] && echo true || echo false)
+            fraction=${TAG_FRACTION:-0.1}
+          else
+            dry_run=$INPUT_DRY_RUN
+            promote=$INPUT_PROMOTE
+            fraction=${INPUT_FRACTION:-0.1}
+          fi
+
+          # Real uploads only from main or a release tag.
+          if [ "$dry_run" != "true" ] && [ "$REF" != "refs/heads/main" ] && [[ "$REF" != refs/tags/v* ]]; then
+            echo "::error::Uploads run only from main or a vX.Y.Z tag (got $REF). Use dry_run for other branches."
+            exit 1
+          fi
+
+          {
+            echo "dry_run=$dry_run"
+            echo "promote=$([ "$dry_run" != "true" ] && echo "$promote" || echo false)"
+            echo "promote_requested=$promote"
+            echo "rollout_fraction=$fraction"
+          } | tee -a "$GITHUB_OUTPUT"
+
+          {
+            echo "### Release options"
+            echo "| Option | Value |"
+            echo "| --- | --- |"
+            echo "| Ref | \`$REF\` |"
+            echo "| Dry run | $dry_run |"
+            echo "| Promote to production | $promote |"
+            echo "| Rollout fraction | $fraction |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle (cached)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Set up Ruby and fastlane (cached)
+        uses: ruby/setup-ruby@v1
+        with:
+          # Gemfile, Gemfile.lock and .ruby-version live at the repo root
+          # (shared with the iOS release workflow).
+          bundler-cache: true
+
+      # Decoded to the runner's temp dir (deleted below); app/build.gradle.kts
+      # reads it through ANDROID_KEYSTORE_PATH like any other release build.
+      - name: Decode upload keystore
+        if: steps.options.outputs.dry_run != 'true'
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 is not set. See docs/android-play-store-release.md#secrets-and-variables."
+            exit 1
+          fi
+          KEYSTORE="$RUNNER_TEMP/upload-keystore.jks"
+          umask 077
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+          echo "ANDROID_KEYSTORE_PATH=$KEYSTORE" >> "$GITHUB_ENV"
+
+      - name: Build and upload to the internal track (fastlane android internal)
+        id: internal
+        env:
+          DRY_RUN: ${{ steps.options.outputs.dry_run }}
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          RELEASE_NOTES_OVERRIDE: ${{ inputs.release_notes }}
+          PLAY_INTERNAL_RELEASE_STATUS: ${{ vars.PLAY_INTERNAL_RELEASE_STATUS || 'completed' }}
+          PLAY_SERVICE_ACCOUNT_JSON_BASE64: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ETHOS_CERT_PINS: ${{ secrets.ETHOS_CERT_PINS }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: bundle exec fastlane android internal dry_run:"$DRY_RUN"
+
+      - name: Remove upload keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/upload-keystore.jks"
+
+      # A dry run also walks the production lane, so a bad rollout fraction
+      # shows up before anyone asks for approval.
+      - name: Validate production promotion (dry run)
+        if: steps.options.outputs.dry_run == 'true' && steps.options.outputs.promote_requested == 'true'
+        env:
+          FRACTION: ${{ steps.options.outputs.rollout_fraction }}
+        run: bundle exec fastlane android production dry_run:true rollout:"$FRACTION"
+
+  production:
+    name: Promote to production (staged rollout)
+    needs: internal
+    if: needs.internal.outputs.promote == 'true'
+    # Protected environment: configure required reviewers (and restrict it to
+    # main + v* tags) so nothing reaches production without a human approval.
+    environment: play-production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Ruby and fastlane (cached)
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: Promote internal build to production (fastlane android production)
+        env:
+          VERSION_CODE: ${{ needs.internal.outputs.version_code }}
+          FRACTION: ${{ needs.internal.outputs.rollout_fraction }}
+          PLAY_SERVICE_ACCOUNT_JSON_BASE64: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON_BASE64 }}
+        run: bundle exec fastlane android production version_code:"$VERSION_CODE" rollout:"$FRACTION"
+
+  # Manage an existing release without building (manual dispatch only).
+  rollout:
+    name: "Production rollout: ${{ inputs.rollout_action }}"
+    if: github.event_name == 'workflow_dispatch' && inputs.rollout_action != 'none'
+    # Dry runs only validate, so they skip the approval gate.
+    environment: ${{ inputs.dry_run && 'play-dry-run' || 'play-production' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Ruby and fastlane (cached)
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: Run rollout action
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          ACTION: ${{ inputs.rollout_action }}
+          FRACTION: ${{ inputs.rollout_fraction }}
+          VERSION_CODE: ${{ inputs.version_code }}
+          REF: ${{ github.ref }}
+          PLAY_SERVICE_ACCOUNT_JSON_BASE64: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON_BASE64 }}
+        run: |
+          if [ "$DRY_RUN" != "true" ] && [ "$REF" != "refs/heads/main" ] && [[ "$REF" != refs/tags/v* ]]; then
+            echo "::error::Rollout changes run only from main or a vX.Y.Z tag (got $REF)."
+            exit 1
+          fi
+          if [ "$ACTION" = "promote" ]; then
+            bundle exec fastlane android production dry_run:"$DRY_RUN" version_code:"$VERSION_CODE" rollout:"$FRACTION"
+          else
+            bundle exec fastlane android rollout dry_run:"$DRY_RUN" action:"$ACTION" rollout:"$FRACTION"
+          fi

@@ -34,6 +34,21 @@ The hooks will:
 - bGoogleService-Info.plist` (iOS Firebase config)
 - Signing keystores (`.keystore`, `.jks`, `.p8`, `.p12`, `.mobileprovision`)
 
+## Security Guidelines
+
+Before your first PR, read [security-guidelines.md](security-guidelines.md). It
+documents the secure coding practices, key management rules, and authentication
+requirements for this codebase, and ends with a **security checklist for pull
+requests** that you should paste into your PR description.
+
+The short version:
+
+- Never commit secrets, signing material, or `gradle.properties` with pins.
+- Store secrets in the Keychain (iOS) or `EncryptedSharedPreferences` (Android) —
+  never `UserDefaults` or plain `SharedPreferences`.
+- Never log tokens, balances, addresses, OTPs, or passkey material.
+- If you touch auth, keys, or networking, work through the extra checklist sections.
+
 ## CI/CD Pipeline
 
 This repository uses GitHub Actions for continuous integration and release

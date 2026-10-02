@@ -9,6 +9,9 @@ This document describes the CI/CD workflow, build artifacts, release process, an
 > A `security.txt` (RFC 9116) is published at
 > [`/.well-known/security.txt`](.well-known/security.txt) and will also be served from
 > `https://ethos-protocol.app/.well-known/security.txt` once the domain is configured.
+>
+> **Contributing?** Read the [Security Guidelines](docs/security-guidelines.md) for secure
+> coding practices, key management, authentication rules, and the PR security checklist.
 
 [![iOS Coverage](https://codecov.io/gh/ethos-protocol/ethos-mobile/branch/main/graph/badge.svg?flag=ios)](https://codecov.io/gh/ethos-protocol/ethos-mobile?flag=ios)
 [![Android Coverage](https://codecov.io/gh/ethos-protocol/ethos-mobile/branch/main/graph/badge.svg?flag=android)](https://codecov.io/gh/ethos-protocol/ethos-mobile?flag=android)
@@ -308,6 +311,13 @@ Pushing a `vX.Y.Z` tag (matching `MARKETING_VERSION` in `ios/EthosProtocol/proje
 - Lanes: `ios/EthosProtocol/fastlane/Fastfile` (`validate`, `beta`, `app_store`)
 - "What's New" generator: `.github/scripts/generate_release_notes.py`
 - Setup, secrets, and the maintainer checklist: [docs/ios-app-store-release.md](docs/ios-app-store-release.md)
+
+### Android Google Play release automation
+The same `vX.Y.Z` tag (matching `versionName` in `android/app/build.gradle.kts`) builds the signed release bundle (AAB) and uploads it to Google Play's internal testing track via fastlane. Promotion to production is a staged rollout (10% by default). It's opt-in and gated behind approval on the `play-production` environment, and manual runs can increase, complete, or halt the rollout. Manual runs default to a dry run.
+
+- Workflow: `.github/workflows/android-play-store-release.yml`
+- Lanes: `android/fastlane/Fastfile` (`validate`, `internal`, `production`, `rollout`)
+- Setup, secrets, the first-release manual step, and the maintainer checklist: [docs/android-play-store-release.md](docs/android-play-store-release.md)
 
 ### App Links Verification (Deep Linking & Passkeys)
 

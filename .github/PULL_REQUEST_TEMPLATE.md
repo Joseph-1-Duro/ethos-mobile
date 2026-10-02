@@ -10,21 +10,22 @@
 
 <!-- How was this tested? (unit tests, manual smoke test, simulator, device, …) -->
 
-## Performance checklist
+## Security checklist
 
-> Full guide, budgets, and profiling instructions:
-> [docs/performance-guide.md](../docs/performance-guide.md). Answer these if your change
-> could plausibly affect performance.
+> Full checklist and rationale: [docs/security-guidelines.md](../docs/security-guidelines.md)
+> (§7). Please answer these before requesting review.
 
-- [ ] No network, disk, or database I/O added on the main thread or in an initializer.
-- [ ] Any new screen or network path is instrumented (`.trackScreen` / `TrackScreen`).
-- [ ] No unbounded loop, collection growth, or retry without a cap.
-- [ ] If a list or screen changed: it is lazy and keyed, derived collections are
-      memoized, and it was checked on a device with 100+ items.
-- [ ] **If this claims a speedup:** a before/after number is included, measured on a
-      physical device in a release build, 3+ iterations, median or p95 reported. "Feels
-      faster" is not a measurement.
-- [ ] **If a threshold or baseline moved:** say so explicitly and justify it.
+- [ ] `pre-commit run --all-files` passes and the diff contains no secrets, signing
+      material, or `gradle.properties` with pins.
+- [ ] No new dependency, or its transitive tree was reviewed and is clean.
+- [ ] Nothing sensitive is logged, and any new sensitive header was added to
+      `LogRedactor` on **both** platforms.
+- [ ] Any new secret is stored in the Keychain / `EncryptedSharedPreferences` and is
+      deleted on sign-out.
+- [ ] New untrusted input is allowlist-validated at the boundary with a length bound.
+- [ ] **If this touches auth, keys, or sessions:** the auth/keys checklist section in
+      the guidelines applies.
+- [ ] **If this touches networking or CI:** the networking/CI checklist sections apply.
 
 <!-- Answer "yes", "no — not applicable", or explain. Don't just delete a line. -->
 
